@@ -27,3 +27,10 @@ Thumbs.db
 
 # Maturin
 Cargo.lock
+
+# gtf
+*.gtf
+*.te.gtf
+*.cntTable
+
+test_data/*

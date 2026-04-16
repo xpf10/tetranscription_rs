@@ -1,210 +1,210 @@
 #!/usr/bin/env python3
 """
 TEcount - Measuring TE expression per-sample.
-Ported from TEtranscripts bin/TEcount, with core computation in Rust.
-
-Usage:
-    TEcount -b RNAseq.bam --GTF gene_annotation.gtf --TE TE_annotation.gtf --sortByPos --mode multi
+Core computation in Rust via PyO3, CLI powered by typer.
 """
 
 import sys
 import os
-import argparse
 import logging
+from typing import Optional
+
+import typer
 
 
-def prepare_parser():
-    desc = "Measuring TE expression per-sample."
-    exmp = "Example: TEcount -b RNAseq.bam --GTF gene_annotation.gtf --TE TE_annotation.gtf --sortByPos --mode multi"
-
-    parser = argparse.ArgumentParser(prog='TEcount', description=desc, epilog=exmp)
-
-    parser.add_argument('-b', '--BAM', metavar='RNAseq.bam', dest='bam', required=True,
-                        help='An RNAseq BAM file.')
-    parser.add_argument('--GTF', metavar='genic-GTF-file', dest='gtffile', type=str, required=True,
-                        help='GTF file for gene annotations')
-    parser.add_argument('--TE', metavar='TE-GTF-file', dest='tefile', type=str, required=True,
-                        help='GTF file for transposable element annotations')
-    parser.add_argument('--format', metavar='input file format', dest='fileformat', type=str,
-                        default='BAM', choices=['BAM', 'SAM'],
-                        help='Input file format: BAM or SAM. DEFAULT: BAM')
-    parser.add_argument('--stranded', metavar='option', dest='stranded', type=str, default="no",
-                        choices=['no', 'forward', 'reverse'],
-                        help='Is this a stranded library? (no, forward, or reverse). DEFAULT: no.')
-    parser.add_argument('--mode', metavar='TE counting mode', dest='te_mode', type=str, default='multi',
-                        choices=['uniq', 'multi'],
-                        help='How to count TE: uniq or multi. DEFAULT: multi')
-    parser.add_argument('--project', metavar='name', dest='prefix', default='TEcount_out',
-                        help='Name of this project. DEFAULT: TEcount_out')
-    parser.add_argument('--outdir', metavar='directory', dest='outdir', nargs='?', default='NULL',
-                        help='Directory for output files. DEFAULT: current directory')
-    parser.add_argument('--sortByPos', dest='sortByPos', action="store_true",
-                        help='Alignment file is sorted by chromosome position.')
-    parser.add_argument('-i', '--iteration', metavar='iteration', dest='numItr', type=int, default=100,
-                        help='Number of iterations for optimization. DEFAULT: 100')
-    parser.add_argument('--maxL', metavar='maxL', dest='maxL', type=int, default=500,
-                        help='Maximum fragment length. DEFAULT: 500')
-    parser.add_argument('--minL', metavar='minL', dest='minL', type=int, default=0,
-                        help='Minimum fragment length. DEFAULT: 0')
-    parser.add_argument('-L', '--fragmentLength', metavar='fragLength', dest='fragLength', type=int, default=0,
-                        help='Average fragment length for single end reads. DEFAULT: 0 (auto-detect)')
-    parser.add_argument('--verbose', metavar='verbose', dest='verbose', type=int, nargs='?', default=2,
-                        const=3,
-                        help='Set verbose level (0-3). DEFAULT: 2')
-    parser.add_argument('--version', action='version', version='%(prog)s 0.1.0')
-
-    return parser
+app = typer.Typer(
+    name="TEcount",
+    help="Measuring TE expression per-sample.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
 
 
-def parse_args(parser):
-    args = parser.parse_args()
+@app.command()
+def count(
+    bam: str = typer.Option(..., "-b", "--BAM", help="An RNAseq BAM file."),
+    gtffile: str = typer.Option(..., "--GTF", help="GTF file for gene annotations."),
+    tefile: str = typer.Option(..., "--TE", help="GTF file for TE annotations."),
+    fileformat: str = typer.Option(
+        "BAM", "--format", help="Input file format: BAM or SAM."
+    ),
+    stranded: str = typer.Option(
+        "no",
+        "--stranded",
+        help="Stranded library? (no, forward, or reverse).",
+    ),
+    te_mode: str = typer.Option(
+        "multi", "--mode", help="How to count TE: uniq or multi."
+    ),
+    prefix: str = typer.Option(
+        "TEcount_out", "--project", help="Name of this project."
+    ),
+    outdir: Optional[str] = typer.Option(
+        None, "--outdir", help="Directory for output files. Default: current directory."
+    ),
+    sort_by_pos: bool = typer.Option(
+        False,
+        "--sortByPos",
+        help="Alignment file is sorted by chromosome position.",
+    ),
+    iteration: int = typer.Option(
+        100, "-i", "--iteration", help="Number of iterations for optimization."
+    ),
+    max_length: int = typer.Option(
+        500, "--maxL", help="Maximum fragment length."
+    ),
+    min_length: int = typer.Option(
+        0, "--minL", help="Minimum fragment length."
+    ),
+    frag_length: int = typer.Option(
+        0, "-L", "--fragmentLength",
+        help="Average fragment length for single-end reads. 0 = auto-detect.",
+    ),
+    verbose: int = typer.Option(
+        2, "--verbose", help="Verbose level (0-3). Default: 2."
+    ),
+    version: bool = typer.Option(
+        False, "--version", help="Show version and exit."
+    ),
+):
+    """Count TE and gene expression from an RNA-seq BAM file."""
+    if version:
+        typer.echo("TEcount 0.1.0")
+        raise typer.Exit()
 
-    # Validate input files
-    if not os.path.isfile(args.bam):
-        logging.error("No such file: %s", args.bam)
-        sys.exit(1)
-    if not os.path.isfile(args.gtffile):
-        logging.error("No such file: %s", args.gtffile)
-        sys.exit(1)
-    if not os.path.isfile(args.tefile):
-        logging.error("No such file: %s", args.tefile)
-        sys.exit(1)
+    # --- validation ---
+    if not os.path.isfile(bam):
+        typer.echo(f"Error: No such file: {bam}", err=True)
+        raise typer.Exit(1)
+    if not os.path.isfile(gtffile):
+        typer.echo(f"Error: No such file: {gtffile}", err=True)
+        raise typer.Exit(1)
+    if not os.path.isfile(tefile):
+        typer.echo(f"Error: No such file: {tefile}", err=True)
+        raise typer.Exit(1)
 
-    # Validate stranded
-    if args.stranded not in ['forward', 'no', 'reverse']:
-        logging.error("Invalid stranded value: %s", args.stranded)
-        sys.exit(1)
+    if fileformat not in ("BAM", "SAM"):
+        typer.echo(f"Error: Invalid format: {fileformat}", err=True)
+        raise typer.Exit(1)
+    if stranded not in ("no", "forward", "reverse"):
+        typer.echo(f"Error: Invalid stranded value: {stranded}", err=True)
+        raise typer.Exit(1)
+    if te_mode not in ("uniq", "multi"):
+        typer.echo(f"Error: Invalid TE mode: {te_mode}", err=True)
+        raise typer.Exit(1)
+    if iteration < 0:
+        iteration = 0
+    if frag_length < 0:
+        typer.echo("Error: Fragment length cannot be negative.", err=True)
+        raise typer.Exit(1)
+    if min_length < 0:
+        typer.echo("Error: Minimum fragment length cannot be negative.", err=True)
+        raise typer.Exit(1)
+    if max_length < 0:
+        typer.echo("Error: Maximum fragment length cannot be negative.", err=True)
+        raise typer.Exit(1)
 
-    # Validate TE mode
-    if args.te_mode not in ['uniq', 'multi']:
-        logging.error("Invalid TE mode: %s", args.te_mode)
-        sys.exit(1)
+    outdir_str = outdir if outdir else None
+    if outdir_str is not None and not os.path.isdir(outdir_str):
+        typer.echo(f"Error: Output directory ({outdir_str}) does not exist.", err=True)
+        raise typer.Exit(1)
 
-    # Validate numeric parameters
-    if args.numItr < 0:
-        args.numItr = 0
-    if args.fragLength < 0:
-        logging.error("Fragment length cannot be negative.")
-        sys.exit(1)
-    if args.minL < 0:
-        logging.error("Minimum fragment length cannot be negative.")
-        sys.exit(1)
-    if args.maxL < 0:
-        logging.error("Maximum fragment length cannot be negative.")
-        sys.exit(1)
-
-    # Validate output directory
-    if args.outdir != "NULL":
-        if not os.path.isdir(args.outdir):
-            logging.error("Output directory (%s) does not exist.", args.outdir)
-            sys.exit(1)
-
-    # Setup logging
+    # --- logging ---
+    log_level = (4 - min(verbose, 3)) * 10
     logging.basicConfig(
-        level=(4 - args.verbose) * 10,
-        format='%(levelname)-5s @ %(asctime)s: %(message)s ',
-        datefmt='%a, %d %b %Y %H:%M:%S',
+        level=log_level,
+        format="%(levelname)-5s @ %(asctime)s: %(message)s ",
+        datefmt="%a, %d %b %Y %H:%M:%S",
         stream=sys.stderr,
-        filemode="w",
     )
+    info = logging.info
 
-    args.sortByPos = bool(args.sortByPos)
-
-    args.argtxt = "\n".join((
+    argtxt = "\n".join((
         "# ARGUMENTS LIST:",
-        "# name = %s" % args.prefix,
-        "# BAM file = %s" % args.bam,
-        "# GTF file = %s" % args.gtffile,
-        "# TE file = %s" % args.tefile,
-        "# multi-mapper mode = %s" % args.te_mode,
-        "# stranded = %s" % args.stranded,
-        "# number of iterations = %d" % args.numItr,
-        "# Alignments grouped by read ID = %s" % (not args.sortByPos),
+        f"# name = {prefix}",
+        f"# BAM file = {bam}",
+        f"# GTF file = {gtffile}",
+        f"# TE file = {tefile}",
+        f"# multi-mapper mode = {te_mode}",
+        f"# stranded = {stranded}",
+        f"# number of iterations = {iteration}",
+        f"# Alignments grouped by read ID = {not sort_by_pos}",
     ))
+    info("\n" + argtxt + "\n")
 
-    return args
-
-
-def output_count_tbl(result, bam_path, prefix):
-    """Output count table to file."""
-    fname = "{}.cntTable".format(prefix)
+    # --- import Rust extension ---
     try:
-        f = open(fname, 'w')
+        from tetranscripts._core import (
+            GeneIndex,
+            TEIndex,
+            count_transcript_abundance as count_fn,
+        )
+    except ImportError:
+        typer.echo(
+            "Error: Rust extension module not found. "
+            "Please run 'maturin develop' or 'pip install .' first.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # --- build indices ---
+    info("Building gene index...")
+    gene_idx = GeneIndex(gtffile, stranded, "exon", "gene_id")
+    info("Done building gene index.")
+
+    info("Building TE index...")
+    te_idx = TEIndex(tefile)
+    info("Done building TE index.")
+
+    # --- count ---
+    info("\nReading sample file...")
+    result = count_fn(
+        bam,
+        gene_idx,
+        te_idx,
+        stranded,
+        te_mode,
+        sort_by_pos,
+        iteration,
+        frag_length,
+        max_length,
+    )
+    info("Finished processing sample file.")
+
+    # --- output ---
+    if outdir_str is not None:
+        os.chdir(outdir_str)
+
+    _output_count_tbl(result, bam, prefix)
+    info(f"Output written to {prefix}.cntTable")
+
+
+def _output_count_tbl(result, bam_path: str, prefix: str):
+    """Write the count table to a .cntTable file."""
+    fname = f"{prefix}.cntTable"
+    try:
+        f = open(fname, "w")
     except IOError:
-        sys.stderr.write("Cannot create report file {}!\n".format(fname))
+        sys.stderr.write(f"Cannot create report file {fname}!\n")
         sys.exit(1)
 
-    header = "gene/TE\t{}".format(bam_path)
-    f.write(header + "\n")
+    f.write(f"gene/TE\t{bam_path}\n")
 
-    # Merge gene and TE counts
-    all_keys = set(result.gene_counts.keys()) | set(result.te_element_counts.keys())
-
-    for gene in sorted(all_keys):
+    all_keys = sorted(set(result.gene_counts.keys()) | set(result.te_element_counts.keys()))
+    for key in all_keys:
         val = 0
-        if gene in result.gene_counts:
-            val = int(result.gene_counts[gene])
-        elif gene in result.te_element_counts:
-            val = int(result.te_element_counts[gene])
-        f.write("{}\t{}\n".format(gene, val))
+        if key in result.gene_counts:
+            val = int(result.gene_counts[key])
+        elif key in result.te_element_counts:
+            val = int(result.te_element_counts[key])
+        f.write(f"{key}\t{val}\n")
 
     f.close()
 
 
-def main():
-    """Main entry point for TEcount."""
-    parser = prepare_parser()
-    args = parse_args(parser)
-
-    info = logging.info
-    info("\n" + args.argtxt + "\n")
-
-    # Import Rust extension
+if __name__ == "__main__":
     try:
-        from tetranscripts._core import GeneIndex, TEIndex, count_transcript_abundance as count_fn
-    except ImportError:
-        sys.stderr.write(
-            "Error: Rust extension module not found. "
-            "Please run 'maturin develop' or 'pip install .' first.\n"
-        )
-        sys.exit(1)
-
-    # Build gene index
-    info("Building gene index...")
-    gene_idx = GeneIndex(args.gtffile, args.stranded, "exon", "gene_id")
-    info("Done building gene index.")
-
-    # Build TE index
-    info("Building TE index...")
-    te_idx = TEIndex(args.tefile)
-    info("Done building TE index.")
-
-    # Count transcript abundance
-    info("\nReading sample file...")
-    result = count_fn(
-        args.bam,
-        gene_idx,
-        te_idx,
-        args.stranded,
-        args.te_mode,
-        args.sortByPos,
-        args.numItr,
-        args.fragLength,
-        args.maxL,
-    )
-    info("Finished processing sample file.")
-
-    # Change to output directory if specified
-    if args.outdir != "NULL":
-        os.chdir(args.outdir)
-
-    output_count_tbl(result, args.bam, args.prefix)
-    info("Output written to {}.cntTable".format(args.prefix))
-
-
-if __name__ == '__main__':
-    try:
-        main()
+        app()
     except KeyboardInterrupt:
         sys.stderr.write("User interrupt!\n")
         sys.exit(0)

@@ -1,9 +1,10 @@
 /// BAM/SAM parsing and core counting loop using noodles (pure Rust).
-/// Ported from bin/TEcount.
+/// Ported from bin/TEcount. Uses Rayon for parallel overlap queries.
 
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
+use rayon::prelude::*;
 
 use crate::annotation::{
     parse_annotations_gene, parse_annotations_te, resolve_annotation_ambiguity_gene,
@@ -65,6 +66,10 @@ struct CountResult {
     total_nonunique: i64,
     total_unannotated: i64,
 }
+
+// ---------------------------------------------------------------------------
+// Helper types and functions
+// ---------------------------------------------------------------------------
 
 fn fetch_exon(chrom: &str, pos: i64, cigar: &[CigarElement], direction: i32) -> Vec<ExonInterval> {
     let mut chrom_st = pos + 1;
@@ -137,16 +142,14 @@ struct ReadInfo {
     is_proper_pair: bool,
     query_length: i64,
     reference_start: i64,
-    clean_name: String,
 }
 
-/// A filtered, parsed alignment ready for grouping by name.
 struct ParsedAlignment {
     clean_name: String,
     info: ReadInfo,
 }
 
-fn parse_record_to_alignment(record: &noodles_bam::Record, _references: &[String]) -> Option<ParsedAlignment> {
+fn parse_record_to_alignment(record: &noodles_bam::Record) -> Option<ParsedAlignment> {
     let flags = record.flags();
     if flags.is_unmapped() || flags.is_duplicate() { return None; }
     if flags.bits() & 512 != 0 { return None; }
@@ -182,11 +185,118 @@ fn parse_record_to_alignment(record: &noodles_bam::Record, _references: &[String
         is_proper_pair: flags.is_properly_segmented(),
         query_length: seq_len,
         reference_start: pos,
-        clean_name: clean_name.clone(),
     };
 
     Some(ParsedAlignment { clean_name, info })
 }
+
+// ---------------------------------------------------------------------------
+// Read group: all alignments sharing the same read name
+// ---------------------------------------------------------------------------
+
+/// A read group ready for parallel overlap annotation.
+enum ReadGroup {
+    Paired {
+        read1s: Vec<ReadInfo>,
+        read2s: Vec<ReadInfo>,
+    },
+    Single {
+        reads: Vec<ReadInfo>,
+    },
+}
+
+/// Result of overlap annotation for one read group (no mutable state needed).
+struct AnnotResult {
+    annot_gene: Vec<Vec<String>>,
+    annot_te: Vec<Vec<usize>>,
+    is_multi: bool,
+    /// For paired unique reads: fragment length info
+    frag_len: Option<i64>,
+}
+
+fn overlap_annotation_readgroup(
+    group: &ReadGroup,
+    references: &[String],
+    gene_index: &GeneIndex,
+    te_index: &TEIndex,
+    stranded: &str,
+) -> AnnotResult {
+    let reads: Vec<(Option<ReadInfo>, Option<ReadInfo>)> = match group {
+        ReadGroup::Paired { read1s, read2s } => {
+            let is_multi = read1s.len() > 1 || read2s.len() > 1;
+            if is_multi {
+                let mut pairs = Vec::new();
+                if read2s.is_empty() {
+                    for r in read1s { pairs.push((Some(r.clone()), None)); }
+                } else if read1s.is_empty() {
+                    for r in read2s { pairs.push((None, Some(r.clone()))); }
+                } else if read2s.len() == read1s.len() {
+                    for j in 0..read1s.len() {
+                        pairs.push((Some(read1s[j].clone()), Some(read2s[j].clone())));
+                    }
+                }
+                pairs
+            } else {
+                let r1 = if read1s.len() == 1 { Some(read1s[0].clone()) } else { None };
+                let r2 = if read2s.len() == 1 { Some(read2s[0].clone()) } else { None };
+                vec![(r1, r2)]
+            }
+        }
+        ReadGroup::Single { reads } => {
+            reads.iter().map(|r| (Some(r.clone()), None)).collect()
+        }
+    };
+
+    let is_multi = reads.len() > 1;
+    let mut frag_len = None;
+    if !is_multi && !reads.is_empty() {
+        if let (Some(ref r1), Some(ref r2)) = (&reads[0].0, &reads[0].1) {
+            if r1.is_proper_pair {
+                let pos1 = r1.reference_start;
+                let pos2 = r2.reference_start;
+                frag_len = Some((pos1 - pos2).abs() + r2.query_length);
+            }
+        }
+    }
+
+    let mut annot_gene: Vec<Vec<String>> = Vec::new();
+    let mut annot_te: Vec<Vec<usize>> = Vec::new();
+
+    for (r1, r2) in &reads {
+        let r1_reverse = r1.as_ref().map(|r| r.is_reverse);
+        let r2_reverse = r2.as_ref().map(|r| r.is_reverse);
+        let direction = get_direction(r1_reverse, r2_reverse, stranded);
+
+        let mut itv_list: Vec<ExonInterval> = Vec::new();
+        if let Some(ref r) = r1 {
+            if r.tid < references.len() {
+                itv_list.extend(fetch_exon(&references[r.tid], r.pos, &r.cigar, direction));
+            }
+        }
+        if let Some(ref r) = r2 {
+            if r.tid < references.len() {
+                itv_list.extend(fetch_exon(&references[r.tid], r.pos, &r.cigar, direction));
+            }
+        }
+
+        let tes = te_index.te_annotation(&itv_list);
+        let genes = gene_index.gene_annotation(&itv_list);
+
+        if !tes.is_empty() { annot_te.push(tes); }
+        if !genes.is_empty() {
+            let mut ug = genes;
+            ug.sort();
+            ug.dedup();
+            annot_gene.push(ug);
+        }
+    }
+
+    AnnotResult { annot_gene, annot_te, is_multi, frag_len }
+}
+
+// ---------------------------------------------------------------------------
+// Main counting function
+// ---------------------------------------------------------------------------
 
 fn count_transcript_abundance(
     bam_path: &str,
@@ -199,6 +309,7 @@ fn count_transcript_abundance(
     frag_length: i64,
     max_length: i64,
 ) -> CountResult {
+    // Phase 1: Read all records from BAM
     let mut reader = noodles_bam::io::reader::Builder::default()
         .build_from_path(bam_path)
         .unwrap_or_else(|e| {
@@ -206,14 +317,79 @@ fn count_transcript_abundance(
             std::process::exit(1);
         });
 
-    let header = reader.read_header()
-        .expect("Error reading BAM header");
-
+    let header = reader.read_header().expect("Error reading BAM header");
     let references: Vec<String> = header.reference_sequences()
         .iter()
         .map(|(name, _)| name.to_string())
         .collect();
 
+    eprintln!("Reading BAM file...");
+    let mut alignments: Vec<ParsedAlignment> = Vec::new();
+    let mut record = noodles_bam::Record::default();
+    let mut paired = false;
+    loop {
+        match reader.read_record(&mut record) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        if let Some(aln) = parse_record_to_alignment(&record) {
+            if aln.info.is_paired { paired = true; }
+            alignments.push(aln);
+        }
+    }
+    eprintln!("Read {} alignments.", alignments.len());
+
+    // Phase 2: Sort by name (parallel if sortByPos, already sorted otherwise)
+    if sort_by_pos {
+        eprintln!("Sorting by read name (parallel)...");
+        alignments.par_sort_by(|a, b| a.clean_name.cmp(&b.clean_name));
+    }
+
+    // Phase 3: Group by read name into ReadGroups
+    eprintln!("Grouping reads by name...");
+    let mut groups: Vec<ReadGroup> = Vec::new();
+
+    if paired {
+        let mut i = 0;
+        while i < alignments.len() {
+            let name = &alignments[i].clean_name;
+            let start = i;
+            while i < alignments.len() && &alignments[i].clean_name == name {
+                i += 1;
+            }
+            let mut read1s = Vec::new();
+            let mut read2s = Vec::new();
+            for j in start..i {
+                let info = alignments[j].info.clone();
+                if info.is_read1 { read1s.push(info.clone()); }
+                if info.is_read2 { read2s.push(info); }
+            }
+            groups.push(ReadGroup::Paired { read1s, read2s });
+        }
+    } else {
+        let mut i = 0;
+        while i < alignments.len() {
+            let name = &alignments[i].clean_name;
+            let start = i;
+            while i < alignments.len() && &alignments[i].clean_name == name {
+                i += 1;
+            }
+            let reads: Vec<ReadInfo> = (start..i).map(|j| alignments[j].info.clone()).collect();
+            groups.push(ReadGroup::Single { reads });
+        }
+    }
+    eprintln!("{} read groups formed.", groups.len());
+
+    // Phase 4: Parallel overlap annotation (read-only on indexes)
+    eprintln!("Running parallel overlap annotation...");
+    let annot_results: Vec<AnnotResult> = groups
+        .par_iter()
+        .map(|group| overlap_annotation_readgroup(group, &references, gene_index, te_index, stranded))
+        .collect();
+
+    // Phase 5: Serial count aggregation
+    eprintln!("Aggregating counts...");
     let mut gene_counts: HashMap<String, f64> = HashMap::new();
     for f in gene_index.features() {
         gene_counts.insert(f, 0.0);
@@ -225,232 +401,57 @@ fn count_transcript_abundance(
     let mut multi_reads: Vec<Vec<usize>> = Vec::new();
     let mut leftover_gene: Vec<(Vec<Vec<String>>, f64)> = Vec::new();
     let mut leftover_te: Vec<(Vec<Vec<usize>>, f64)> = Vec::new();
-
     let mut empty: i64 = 0;
     let mut nonunique: i64 = 0;
     let mut uniq_reads: i64 = 0;
     let mut avg_read_length: i64 = 0;
     let mut tmp_cnt: i64 = 0;
-    let mut paired = false;
 
-    if sort_by_pos {
-        // ---- sortByPos path: collect all records, sort by name, then group ----
-        eprintln!("BAM sorted by position. Reading all alignments into memory for name-sorting...");
-
-        let mut alignments: Vec<ParsedAlignment> = Vec::new();
-        let mut record = noodles_bam::Record::default();
-        loop {
-            match reader.read_record(&mut record) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => continue,
+    for res in &annot_results {
+        if res.is_multi {
+            nonunique += 1;
+            if te_mode == "uniq" {
+                empty += 1;
+                continue;
             }
-            if let Some(aln) = parse_record_to_alignment(&record, &references) {
-                if aln.info.is_paired { paired = true; }
-                alignments.push(aln);
-            }
-        }
-        eprintln!("Read {} alignments. Sorting by read name...", alignments.len());
-        alignments.sort_by(|a, b| a.clean_name.cmp(&b.clean_name));
-        eprintln!("Sorting done. Processing...");
-
-        let mut i: i64 = 0;
-        let mut prev_name = String::new();
-        let mut multi_read1: Vec<ReadInfo> = Vec::new();
-        let mut multi_read2: Vec<ReadInfo> = Vec::new();
-        let mut alignments_per_read: Vec<(Option<ReadInfo>, Option<ReadInfo>)> = Vec::new();
-
-        for aln in alignments {
-            i += 1;
-            let clean_name = aln.clean_name;
-            let read_info = aln.info;
-
-            if paired {
-                if clean_name == prev_name || prev_name.is_empty() {
-                    prev_name = clean_name;
-                    if read_info.is_read1 { multi_read1.push(read_info.clone()); }
-                    if read_info.is_read2 { multi_read2.push(read_info); }
-                    continue;
+        } else {
+            uniq_reads += 1;
+            if let Some(fl) = res.frag_len {
+                if fl <= max_length && tmp_cnt < 10000 {
+                    avg_read_length += fl;
+                    tmp_cnt += 1;
                 }
-
-                process_read_group_paired(
-                    &multi_read1, &multi_read2, &references, gene_index, te_index,
-                    stranded, te_mode, &mut alignments_per_read,
-                    &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                    &mut multi_reads, &mut leftover_gene, &mut leftover_te,
-                    &mut uniq_reads, &mut nonunique, &mut empty,
-                    &mut avg_read_length, &mut tmp_cnt, max_length,
-                );
-                alignments_per_read.clear();
-                multi_read1.clear();
-                multi_read2.clear();
-                prev_name = clean_name;
-                if read_info.is_read1 { multi_read1.push(read_info.clone()); }
-                if read_info.is_read2 { multi_read2.push(read_info); }
-            } else {
-                if clean_name == prev_name || prev_name.is_empty() {
-                    alignments_per_read.push((Some(read_info), None));
-                    prev_name = clean_name;
-                    continue;
-                }
-
-                if tmp_cnt < 10000 {
-                    if let Some(ref r) = alignments_per_read[0].0 {
-                        avg_read_length += r.query_length;
-                        tmp_cnt += 1;
-                    }
-                }
-
-                if alignments_per_read.len() == 1 {
-                    uniq_reads += 1;
-                } else {
-                    nonunique += 1;
-                    if te_mode == "uniq" {
-                        empty += 1;
-                        alignments_per_read.clear();
-                        prev_name = clean_name;
-                        alignments_per_read.push((Some(read_info), None));
-                        continue;
-                    }
-                }
-
-                annotate_and_count(
-                    &alignments_per_read, &references, gene_index, te_index,
-                    stranded, &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                    &mut multi_reads, &mut leftover_gene, &mut leftover_te, &mut empty,
-                );
-
-                if i % 1_000_000 == 0 {
-                    eprintln!("{} alignments processed.", i);
-                }
-                alignments_per_read.clear();
-                prev_name = clean_name;
-                alignments_per_read.push((Some(read_info), None));
             }
         }
 
-        // Process last group
-        if paired {
-            process_read_group_paired(
-                &multi_read1, &multi_read2, &references, gene_index, te_index,
-                stranded, te_mode, &mut alignments_per_read,
-                &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                &mut multi_reads, &mut leftover_gene, &mut leftover_te,
-                &mut uniq_reads, &mut nonunique, &mut empty,
-                &mut avg_read_length, &mut tmp_cnt, max_length,
+        let num_alignments = if res.is_multi {
+            res.annot_gene.len().max(res.annot_te.len()).max(1)
+        } else {
+            1
+        };
+
+        if num_alignments > 1 {
+            let no_annot_te = parse_annotations_te(
+                &res.annot_te, &mut te_counts, &mut te_multi_counts,
+                &mut multi_reads, &mut leftover_te,
             );
-        } else if !alignments_per_read.is_empty() {
-            if alignments_per_read.len() == 1 { uniq_reads += 1; } else { nonunique += 1; }
-            annotate_and_count(
-                &alignments_per_read, &references, gene_index, te_index,
-                stranded, &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                &mut multi_reads, &mut leftover_gene, &mut leftover_te, &mut empty,
-            );
-        }
-    } else {
-        // ---- Name-sorted BAM path: streaming ----
-        let mut i: i64 = 0;
-        let mut prev_read_name = String::new();
-        let mut alignments_per_read: Vec<(Option<ReadInfo>, Option<ReadInfo>)> = Vec::new();
-        let mut multi_read1: Vec<ReadInfo> = Vec::new();
-        let mut multi_read2: Vec<ReadInfo> = Vec::new();
-        let mut record = noodles_bam::Record::default();
-
-        loop {
-            match reader.read_record(&mut record) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => continue,
-            }
-
-            i += 1;
-            let Some(aln) = parse_record_to_alignment(&record, &references) else { continue };
-            let clean_name = aln.clean_name;
-            let read_info = aln.info;
-
-            if read_info.is_paired { paired = true; }
-
-            if paired {
-                if clean_name == prev_read_name || prev_read_name.is_empty() {
-                    prev_read_name = clean_name;
-                    if read_info.is_read1 { multi_read1.push(read_info.clone()); }
-                    if read_info.is_read2 { multi_read2.push(read_info); }
-                    continue;
-                }
-
-                process_read_group_paired(
-                    &multi_read1, &multi_read2, &references, gene_index, te_index,
-                    stranded, te_mode, &mut alignments_per_read,
-                    &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                    &mut multi_reads, &mut leftover_gene, &mut leftover_te,
-                    &mut uniq_reads, &mut nonunique, &mut empty,
-                    &mut avg_read_length, &mut tmp_cnt, max_length,
+            if no_annot_te {
+                let no_annot_gene = parse_annotations_gene(
+                    &res.annot_gene, &mut gene_counts, &mut leftover_gene,
                 );
-                alignments_per_read.clear();
-                multi_read1.clear();
-                multi_read2.clear();
-                prev_read_name = clean_name;
-                if read_info.is_read1 { multi_read1.push(read_info.clone()); }
-                if read_info.is_read2 { multi_read2.push(read_info); }
-            } else {
-                if clean_name == prev_read_name || prev_read_name.is_empty() {
-                    alignments_per_read.push((Some(read_info), None));
-                    prev_read_name = clean_name;
-                    continue;
-                }
-
-                if tmp_cnt < 10000 {
-                    if let Some(ref r) = alignments_per_read[0].0 {
-                        avg_read_length += r.query_length;
-                        tmp_cnt += 1;
-                    }
-                }
-
-                if alignments_per_read.len() == 1 {
-                    uniq_reads += 1;
-                } else {
-                    nonunique += 1;
-                    if te_mode == "uniq" {
-                        empty += 1;
-                        alignments_per_read.clear();
-                        prev_read_name = clean_name;
-                        alignments_per_read.push((Some(read_info), None));
-                        continue;
-                    }
-                }
-
-                annotate_and_count(
-                    &alignments_per_read, &references, gene_index, te_index,
-                    stranded, &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                    &mut multi_reads, &mut leftover_gene, &mut leftover_te, &mut empty,
-                );
-
-                if i % 1_000_000 == 0 {
-                    eprintln!("{} alignments processed.", i);
-                }
-                alignments_per_read.clear();
-                prev_read_name = clean_name;
-                alignments_per_read.push((Some(read_info), None));
+                if no_annot_gene { empty += 1; }
             }
-        }
-
-        // Process last read group
-        if paired {
-            process_read_group_paired(
-                &multi_read1, &multi_read2, &references, gene_index, te_index,
-                stranded, te_mode, &mut alignments_per_read,
-                &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                &mut multi_reads, &mut leftover_gene, &mut leftover_te,
-                &mut uniq_reads, &mut nonunique, &mut empty,
-                &mut avg_read_length, &mut tmp_cnt, max_length,
+        } else {
+            let no_annot_gene = parse_annotations_gene(
+                &res.annot_gene, &mut gene_counts, &mut leftover_gene,
             );
-        } else if !alignments_per_read.is_empty() {
-            if alignments_per_read.len() == 1 { uniq_reads += 1; } else { nonunique += 1; }
-            annotate_and_count(
-                &alignments_per_read, &references, gene_index, te_index,
-                stranded, &mut gene_counts, &mut te_counts, &mut te_multi_counts,
-                &mut multi_reads, &mut leftover_gene, &mut leftover_te, &mut empty,
-            );
+            if no_annot_gene {
+                let no_annot_te = parse_annotations_te(
+                    &res.annot_te, &mut te_counts, &mut te_multi_counts,
+                    &mut multi_reads, &mut leftover_te,
+                );
+                if no_annot_te { empty += 1; }
+            }
         }
     }
 
@@ -500,126 +501,4 @@ fn count_transcript_abundance(
         total_nonunique: nonunique,
         total_unannotated: empty,
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_read_group_paired(
-    multi_read1: &[ReadInfo], multi_read2: &[ReadInfo],
-    references: &[String], gene_index: &GeneIndex, te_index: &TEIndex,
-    stranded: &str, te_mode: &str,
-    alignments_per_read: &mut Vec<(Option<ReadInfo>, Option<ReadInfo>)>,
-    gene_counts: &mut HashMap<String, f64>,
-    te_counts: &mut Vec<f64>, te_multi_counts: &mut Vec<f64>,
-    multi_reads: &mut Vec<Vec<usize>>,
-    leftover_gene: &mut Vec<(Vec<Vec<String>>, f64)>,
-    leftover_te: &mut Vec<(Vec<Vec<usize>>, f64)>,
-    uniq_reads: &mut i64, nonunique: &mut i64, empty: &mut i64,
-    avg_read_length: &mut i64, tmp_cnt: &mut i64, max_length: i64,
-) {
-    if multi_read1.len() <= 1 && multi_read2.len() <= 1 {
-        *uniq_reads += 1;
-        let read1 = if multi_read1.len() == 1 { Some(multi_read1[0].clone()) } else { None };
-        let read2 = if multi_read2.len() == 1 { Some(multi_read2[0].clone()) } else { None };
-
-        if let (Some(ref r1), Some(ref r2)) = (&read1, &read2) {
-            if r1.is_proper_pair && *tmp_cnt < 10000 {
-                let pos1 = r1.reference_start;
-                let pos2 = r2.reference_start;
-                if (pos1 - pos2).abs() <= max_length {
-                    *avg_read_length += (pos1 - pos2).abs() + r2.query_length;
-                    *tmp_cnt += 1;
-                }
-            }
-        }
-        alignments_per_read.push((read1, read2));
-    } else {
-        *nonunique += 1;
-        if te_mode == "uniq" { *empty += 1; return; }
-
-        if multi_read2.is_empty() {
-            for r in multi_read1 { alignments_per_read.push((Some(r.clone()), None)); }
-        } else if multi_read1.is_empty() {
-            for r in multi_read2 { alignments_per_read.push((None, Some(r.clone()))); }
-        } else if multi_read2.len() == multi_read1.len() {
-            for j in 0..multi_read1.len() {
-                alignments_per_read.push((Some(multi_read1[j].clone()), Some(multi_read2[j].clone())));
-            }
-        }
-    }
-
-    annotate_and_count(
-        alignments_per_read, references, gene_index, te_index,
-        stranded, gene_counts, te_counts, te_multi_counts,
-        multi_reads, leftover_gene, leftover_te, empty,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn annotate_and_count(
-    alignments: &[(Option<ReadInfo>, Option<ReadInfo>)],
-    references: &[String], gene_index: &GeneIndex, te_index: &TEIndex,
-    stranded: &str,
-    gene_counts: &mut HashMap<String, f64>,
-    te_counts: &mut Vec<f64>, te_multi_counts: &mut Vec<f64>,
-    multi_reads: &mut Vec<Vec<usize>>,
-    leftover_gene: &mut Vec<(Vec<Vec<String>>, f64)>,
-    leftover_te: &mut Vec<(Vec<Vec<usize>>, f64)>,
-    empty: &mut i64,
-) {
-    let (annot_gene, annot_te) = overlap_annotation(alignments, references, gene_index, te_index, stranded);
-
-    if alignments.len() > 1 {
-        let no_annot_te = parse_annotations_te(&annot_te, te_counts, te_multi_counts, multi_reads, leftover_te);
-        if no_annot_te {
-            let no_annot_gene = parse_annotations_gene(&annot_gene, gene_counts, leftover_gene);
-            if no_annot_gene { *empty += 1; }
-        }
-    } else {
-        let no_annot_gene = parse_annotations_gene(&annot_gene, gene_counts, leftover_gene);
-        if no_annot_gene {
-            let no_annot_te = parse_annotations_te(&annot_te, te_counts, te_multi_counts, multi_reads, leftover_te);
-            if no_annot_te { *empty += 1; }
-        }
-    }
-}
-
-fn overlap_annotation(
-    reads: &[(Option<ReadInfo>, Option<ReadInfo>)],
-    references: &[String], gene_index: &GeneIndex, te_index: &TEIndex,
-    stranded: &str,
-) -> (Vec<Vec<String>>, Vec<Vec<usize>>) {
-    let mut annot_gene: Vec<Vec<String>> = Vec::new();
-    let mut annot_te: Vec<Vec<usize>> = Vec::new();
-
-    for (r1, r2) in reads {
-        let r1_reverse = r1.as_ref().map(|r| r.is_reverse);
-        let r2_reverse = r2.as_ref().map(|r| r.is_reverse);
-        let direction = get_direction(r1_reverse, r2_reverse, stranded);
-
-        let mut itv_list: Vec<ExonInterval> = Vec::new();
-
-        if let Some(ref r) = r1 {
-            if r.tid < references.len() {
-                itv_list.extend(fetch_exon(&references[r.tid], r.pos, &r.cigar, direction));
-            }
-        }
-        if let Some(ref r) = r2 {
-            if r.tid < references.len() {
-                itv_list.extend(fetch_exon(&references[r.tid], r.pos, &r.cigar, direction));
-            }
-        }
-
-        let tes = te_index.te_annotation(&itv_list);
-        let genes = gene_index.gene_annotation(&itv_list);
-
-        if !tes.is_empty() { annot_te.push(tes); }
-        if !genes.is_empty() {
-            let mut ug = genes;
-            ug.sort();
-            ug.dedup();
-            annot_gene.push(ug);
-        }
-    }
-
-    (annot_gene, annot_te)
 }
