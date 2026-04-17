@@ -58,5 +58,4 @@ pub struct CigarElement {
 }
 
 /// Constants
-pub const TEINDEX_BINSIZE: i64 = 500;
 pub const OPT_TOL: f64 = 0.0001;

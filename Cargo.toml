@@ -12,3 +12,4 @@ pyo3 = { version = "0.23", features = ["extension-module"] }
 noodles-bam = "0.68"
 noodles-sam = "0.65"
 rayon = "1.10"
+smallvec = "1.13"

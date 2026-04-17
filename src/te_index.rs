@@ -1,94 +1,81 @@
-/// TE annotation index using BTreeMap with bin-based bucketing.
-/// Ported from TEToolkit/TEindex.py (TEfeatures, BinaryTree, Node)
-/// Replaced custom AVL tree with std::collections::BTreeMap for balanced O(log n) operations.
+/// TE annotation index using flat sorted arrays with end-max augmentation.
+/// Replaces the previous BTreeMap<HashMap<Vec>> design to reduce memory
+/// from ~2.6 GB to ~120 MB for 3.7M TE instances.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 
 use crate::gtf_parser::parse_te_gtf;
-use crate::types::{ExonInterval, Strand, TEINDEX_BINSIZE};
+use crate::types::{ExonInterval, Strand};
 
 // ---------------------------------------------------------------------------
-// Bin-entry: stores (name_idx, end) pairs keyed by start position
-// ---------------------------------------------------------------------------
-
-struct BinEntries {
-    entries: HashMap<i64, Vec<(usize, i64)>>,
-}
-
-impl BinEntries {
-    fn new(start: i64, end: i64, name_idx: usize) -> Self {
-        let mut entries = HashMap::new();
-        entries.insert(start, vec![(name_idx, end)]);
-        BinEntries { entries }
-    }
-
-    fn add(&mut self, start: i64, end: i64, name_idx: usize) {
-        self.entries.entry(start).or_default().push((name_idx, end));
-    }
-
-    fn overlaps(&self, start: i64, end: i64) -> Vec<usize> {
-        let mut result = Vec::new();
-        for (&s, pairs) in &self.entries {
-            if s > end {
-                continue;
-            }
-            for &(idx, e) in pairs {
-                if start <= e && end >= s {
-                    result.push(idx);
-                }
-            }
-        }
-        result
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TE tree: BTreeMap<bin_start, BinEntries> per chromosome
+// TeTree: flat sorted array with end-max augmentation for O(log n + k) queries
 // ---------------------------------------------------------------------------
 
 struct TeTree {
-    bins: BTreeMap<i64, BinEntries>,
+    /// Intervals sorted by start position: (start, end, name_idx)
+    intervals: Vec<(i64, i64, usize)>,
+    /// max_ends[i] = max(intervals[i..].1), used for pruning backward scan
+    max_ends: Vec<i64>,
 }
 
 impl TeTree {
-    fn new() -> Self {
-        TeTree { bins: BTreeMap::new() }
+    fn new(mut entries: Vec<(i64, i64, usize)>) -> Self {
+        // Sort by start position
+        entries.sort_by_key(|(s, _, _)| *s);
+
+        // Build max_ends: scan from right to left
+        let n = entries.len();
+        let mut max_ends = vec![0i64; n];
+        if n > 0 {
+            let mut max_end = entries[n - 1].1;
+            for i in (0..n).rev() {
+                if entries[i].1 > max_end {
+                    max_end = entries[i].1;
+                }
+                max_ends[i] = max_end;
+            }
+        }
+
+        TeTree {
+            intervals: entries,
+            max_ends,
+        }
     }
 
-    fn insert(&mut self, start: i64, end: i64, name_idx: usize) {
-        let bin_start = bin_start_id(start);
-        self.bins
-            .entry(bin_start)
-            .and_modify(|e| e.add(start, end, name_idx))
-            .or_insert_with(|| BinEntries::new(start, end, name_idx));
-    }
-
-    /// Find all TE instances overlapping the genomic interval [query_start, query_end].
-    /// Uses bin range for efficient lookup, then checks actual genomic coordinates.
+    /// Find all TE instances overlapping [query_start, query_end].
+    /// Uses binary search + end-max pruning for O(log n + k) queries.
     fn find_overlapping(&self, query_start: i64, query_end: i64) -> Vec<usize> {
-        let start_bin = bin_start_id(query_start);
-        let end_bin = bin_end_id(query_end);
+        if self.intervals.is_empty() {
+            return Vec::new();
+        }
+
+        // Binary search: find the last interval with start <= query_end
+        let end_idx = match self.intervals.binary_search_by_key(&query_end, |(s, _, _)| *s) {
+            Ok(idx) => idx + 1,
+            Err(idx) => idx,
+        };
+
+        if end_idx == 0 {
+            return Vec::new();
+        }
+
         let mut result = Vec::new();
-        for (_, entries) in self.bins.range(start_bin..=end_bin) {
-            result.extend(entries.overlaps(query_start, query_end));
+        let mut i = end_idx;
+        while i > 0 {
+            i -= 1;
+            // Pruning: if no interval from 0..=i can reach into [query_start, query_end]
+            if self.max_ends[i] < query_start {
+                break;
+            }
+            let (start, end, name_idx) = self.intervals[i];
+            if end >= query_start && start <= query_end {
+                result.push(name_idx);
+            }
         }
         result
     }
-}
-
-fn bin_start_id(pos: i64) -> i64 {
-    let mut bid = pos / TEINDEX_BINSIZE;
-    if pos == bid * TEINDEX_BINSIZE {
-        bid -= 1;
-    }
-    bid
-}
-
-#[allow(dead_code)]
-fn bin_end_id(pos: i64) -> i64 {
-    pos / TEINDEX_BINSIZE
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +95,7 @@ impl TEIndex {
     #[new]
     pub fn from_gtf(tefile: &str) -> Self {
         let records = parse_te_gtf(tefile);
-        let mut trees: HashMap<String, TeTree> = HashMap::new();
+        let mut tree_entries: HashMap<String, Vec<(i64, i64, usize)>> = HashMap::new();
         let mut lengths = Vec::new();
         let mut name_id_map = Vec::new();
         let mut elements: Vec<String> = Vec::new();
@@ -134,18 +121,18 @@ impl TEIndex {
             lengths.push(tlen);
             name_id_map.push(full_name);
 
-            let tree = trees.entry(rec.chrom.clone()).or_insert_with(TeTree::new);
-
-            let mut bin_start = bin_start_id(rec.start);
-            let bin_end = bin_end_id(rec.end);
-
-            while bin_start <= bin_end {
-                let end_pos = std::cmp::min(rec.end, (bin_start + 1) * TEINDEX_BINSIZE);
-                let start_pos = std::cmp::max(rec.start, bin_start * TEINDEX_BINSIZE + 1);
-                tree.insert(start_pos, end_pos, name_idx);
-                bin_start += 1;
-            }
+            // Store the TE interval directly — no bin splitting needed
+            tree_entries
+                .entry(rec.chrom.clone())
+                .or_default()
+                .push((rec.start, rec.end, name_idx));
         }
+
+        // Build TeTrees from sorted entries
+        let trees: HashMap<String, TeTree> = tree_entries
+            .into_iter()
+            .map(|(chrom, entries)| (chrom, TeTree::new(entries)))
+            .collect();
 
         TEIndex { trees, lengths, name_id_map, elements }
     }

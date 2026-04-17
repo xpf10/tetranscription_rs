@@ -34,3 +34,5 @@ Cargo.lock
 *.cntTable
 
 test_data/*
+
+CLAUDE.md

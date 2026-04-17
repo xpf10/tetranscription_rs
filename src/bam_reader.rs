@@ -1,10 +1,12 @@
 /// BAM/SAM parsing and core counting loop using noodles (pure Rust).
-/// Ported from bin/TEcount. Uses Rayon for parallel overlap queries.
+/// Uses batched streaming to bound memory, with Rayon parallelism per batch.
 
 use std::collections::HashMap;
+use std::io::Read;
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use crate::annotation::{
     parse_annotations_gene, parse_annotations_te, resolve_annotation_ambiguity_gene,
@@ -15,7 +17,10 @@ use crate::gene_index::GeneIndex;
 use crate::te_index::TEIndex;
 use crate::types::{CigarElement, ExonInterval, Strand};
 
-/// Python-facing count result
+// ---------------------------------------------------------------------------
+// Python-facing types
+// ---------------------------------------------------------------------------
+
 #[pyclass]
 pub struct PyCountResult {
     #[pyo3(get)]
@@ -68,7 +73,110 @@ struct CountResult {
 }
 
 // ---------------------------------------------------------------------------
-// Helper types and functions
+// Core types
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct ReadInfo {
+    tid: usize,
+    pos: i64,
+    cigar: SmallVec<[CigarElement; 4]>,
+    is_reverse: bool,
+    is_read1: bool,
+    is_read2: bool,
+    is_paired: bool,
+    is_proper_pair: bool,
+    query_length: i64,
+    reference_start: i64,
+}
+
+enum ReadGroup {
+    Paired {
+        read1s: Vec<ReadInfo>,
+        read2s: Vec<ReadInfo>,
+    },
+    Single {
+        reads: Vec<ReadInfo>,
+    },
+}
+
+struct AnnotResult {
+    annot_gene: Vec<Vec<String>>,
+    annot_te: Vec<Vec<usize>>,
+    is_multi: bool,
+    frag_len: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// BAM record parsing helpers
+// ---------------------------------------------------------------------------
+
+fn convert_cigar(record: &noodles_bam::Record) -> SmallVec<[CigarElement; 4]> {
+    let mut result = SmallVec::new();
+    for op_result in record.cigar().iter() {
+        let op_val = match op_result {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let len: i64 = op_val.len() as i64;
+        let code: u32 = if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Match { 0 }
+            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Insertion { 1 }
+            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Deletion { 2 }
+            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Skip { 3 }
+            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::SoftClip { 4 }
+            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::HardClip { 5 }
+            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::SequenceMatch { 7 }
+            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::SequenceMismatch { 8 }
+            else { continue; };
+        result.push(CigarElement { code, len });
+    }
+    result
+}
+
+/// Parse a BAM record into (clean_name, ReadInfo). Returns None for unmapped/duplicate/QC-fail.
+fn parse_record(record: &noodles_bam::Record) -> Option<(String, ReadInfo)> {
+    let flags = record.flags();
+    if flags.is_unmapped() || flags.is_duplicate() { return None; }
+    if flags.bits() & 512 != 0 { return None; }
+
+    let cur_read_name = record.name().map(|n| n.to_string()).unwrap_or_default();
+    let cigar = convert_cigar(record);
+    let tid = match record.reference_sequence_id() {
+        Some(Ok(id)) => id,
+        _ => return None,
+    };
+    let pos = match record.alignment_start() {
+        Some(Ok(p)) => p.get() as i64 - 1,
+        _ => return None,
+    };
+    let seq_len = record.sequence().len() as i64;
+    let is_paired = flags.is_segmented();
+
+    let clean_name = if is_paired {
+        let idx = cur_read_name.find('/').unwrap_or(cur_read_name.len());
+        cur_read_name[..idx].to_string()
+    } else {
+        cur_read_name
+    };
+
+    let info = ReadInfo {
+        tid,
+        pos,
+        cigar,
+        is_reverse: flags.is_reverse_complemented(),
+        is_read1: flags.is_first_segment(),
+        is_read2: flags.is_last_segment(),
+        is_paired,
+        is_proper_pair: flags.is_properly_segmented(),
+        query_length: seq_len,
+        reference_start: pos,
+    };
+
+    Some((clean_name, info))
+}
+
+// ---------------------------------------------------------------------------
+// Exon interval extraction
 // ---------------------------------------------------------------------------
 
 fn fetch_exon(chrom: &str, pos: i64, cigar: &[CigarElement], direction: i32) -> Vec<ExonInterval> {
@@ -108,111 +216,9 @@ fn get_direction(r1_reverse: Option<bool>, r2_reverse: Option<bool>, stranded: &
     }
 }
 
-fn convert_cigar(record: &noodles_bam::Record) -> Vec<CigarElement> {
-    let mut result = Vec::new();
-    for op_result in record.cigar().iter() {
-        let op_val = match op_result {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let len: i64 = op_val.len() as i64;
-        let code: u32 = if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Match { 0 }
-            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Insertion { 1 }
-            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Deletion { 2 }
-            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::Skip { 3 }
-            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::SoftClip { 4 }
-            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::HardClip { 5 }
-            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::SequenceMatch { 7 }
-            else if op_val.kind() == noodles_sam::alignment::record::cigar::op::Kind::SequenceMismatch { 8 }
-            else { continue; };
-        result.push(CigarElement { code, len });
-    }
-    result
-}
-
-#[derive(Clone)]
-struct ReadInfo {
-    tid: usize,
-    pos: i64,
-    cigar: Vec<CigarElement>,
-    is_reverse: bool,
-    is_read1: bool,
-    is_read2: bool,
-    is_paired: bool,
-    is_proper_pair: bool,
-    query_length: i64,
-    reference_start: i64,
-}
-
-struct ParsedAlignment {
-    clean_name: String,
-    info: ReadInfo,
-}
-
-fn parse_record_to_alignment(record: &noodles_bam::Record) -> Option<ParsedAlignment> {
-    let flags = record.flags();
-    if flags.is_unmapped() || flags.is_duplicate() { return None; }
-    if flags.bits() & 512 != 0 { return None; }
-
-    let cur_read_name = record.name().map(|n| n.to_string()).unwrap_or_default();
-    let cigar = convert_cigar(record);
-    let tid = match record.reference_sequence_id() {
-        Some(Ok(id)) => id,
-        _ => return None,
-    };
-    let pos = match record.alignment_start() {
-        Some(Ok(p)) => p.get() as i64 - 1,
-        _ => return None,
-    };
-    let seq_len = record.sequence().len() as i64;
-    let is_paired = flags.is_segmented();
-
-    let clean_name = if is_paired {
-        let added_flag_pos = cur_read_name.find('/').unwrap_or(cur_read_name.len());
-        cur_read_name[..added_flag_pos].to_string()
-    } else {
-        cur_read_name
-    };
-
-    let info = ReadInfo {
-        tid,
-        pos,
-        cigar,
-        is_reverse: flags.is_reverse_complemented(),
-        is_read1: flags.is_first_segment(),
-        is_read2: flags.is_last_segment(),
-        is_paired,
-        is_proper_pair: flags.is_properly_segmented(),
-        query_length: seq_len,
-        reference_start: pos,
-    };
-
-    Some(ParsedAlignment { clean_name, info })
-}
-
 // ---------------------------------------------------------------------------
-// Read group: all alignments sharing the same read name
+// Overlap annotation for a read group
 // ---------------------------------------------------------------------------
-
-/// A read group ready for parallel overlap annotation.
-enum ReadGroup {
-    Paired {
-        read1s: Vec<ReadInfo>,
-        read2s: Vec<ReadInfo>,
-    },
-    Single {
-        reads: Vec<ReadInfo>,
-    },
-}
-
-/// Result of overlap annotation for one read group (no mutable state needed).
-struct AnnotResult {
-    annot_gene: Vec<Vec<String>>,
-    annot_te: Vec<Vec<usize>>,
-    is_multi: bool,
-    /// For paired unique reads: fragment length info
-    frag_len: Option<i64>,
-}
 
 fn overlap_annotation_readgroup(
     group: &ReadGroup,
@@ -295,6 +301,253 @@ fn overlap_annotation_readgroup(
 }
 
 // ---------------------------------------------------------------------------
+// BamGroupStreamer: reads BAM and yields batches of ReadGroups
+// ---------------------------------------------------------------------------
+
+struct BamGroupStreamer<R: Read> {
+    reader: noodles_bam::io::Reader<R>,
+    batch_size: usize,
+    finished: bool,
+    paired: bool,
+    pending: Option<(String, ReadInfo)>,
+    record_buf: noodles_bam::Record,
+    total_groups: usize,
+    total_alignments: usize,
+}
+
+impl<R: Read> BamGroupStreamer<R> {
+    fn new(
+        reader: noodles_bam::io::Reader<R>,
+        batch_size: usize,
+    ) -> Self {
+        // Read header (already consumed by caller, so we skip this)
+        // Actually the caller must NOT have read the header yet from this reader.
+        // But in our design, the caller reads the header, creates references, then
+        // passes the reader here. So we don't read header again.
+        BamGroupStreamer {
+            reader,
+            batch_size,
+            finished: false,
+            paired: false,
+            pending: None,
+            record_buf: noodles_bam::Record::default(),
+            total_groups: 0,
+            total_alignments: 0,
+        }
+    }
+
+    /// Read the next batch of ReadGroups. Returns None when BAM is exhausted.
+    fn next_batch(&mut self) -> Option<Vec<ReadGroup>> {
+        if self.finished {
+            return None;
+        }
+
+        let mut groups: Vec<ReadGroup> = Vec::with_capacity(self.batch_size);
+        let mut current_name: Option<String> = None;
+        let mut current_read1s: Vec<ReadInfo> = Vec::new();
+        let mut current_read2s: Vec<ReadInfo> = Vec::new();
+        let mut current_singles: Vec<ReadInfo> = Vec::new();
+
+        // Seed with pending record from previous batch
+        if let Some((name, info)) = self.pending.take() {
+            if info.is_paired { self.paired = true; }
+            current_name = Some(name);
+            if self.paired {
+                if info.is_read1 { current_read1s.push(info); }
+                else if info.is_read2 { current_read2s.push(info); }
+            } else {
+                current_singles.push(info);
+            }
+        }
+
+        loop {
+            // Read next record
+            let got = match self.reader.read_record(&mut self.record_buf) {
+                Ok(0) => false,
+                Ok(_) => true,
+                Err(_) => continue,
+            };
+
+            if !got {
+                // EOF: finalize current group
+                self.finalize_group(
+                    &mut current_name,
+                    &mut current_read1s,
+                    &mut current_read2s,
+                    &mut current_singles,
+                    &mut groups,
+                );
+                self.finished = true;
+                break;
+            }
+
+            let parsed = parse_record(&self.record_buf);
+
+            match parsed {
+                Some((name, info)) => {
+                    self.total_alignments += 1;
+                    if info.is_paired { self.paired = true; }
+
+                    // Check if this starts a new group
+                    let name_changed = match &current_name {
+                        Some(cur) => &name != cur,
+                        None => false, // first record, start new group
+                    };
+
+                    if name_changed {
+                        // Finalize current group
+                        self.finalize_group(
+                            &mut current_name,
+                            &mut current_read1s,
+                            &mut current_read2s,
+                            &mut current_singles,
+                            &mut groups,
+                        );
+
+                        // Batch full? Save this record as pending and return.
+                        if groups.len() >= self.batch_size {
+                            self.pending = Some((name, info));
+                            break;
+                        }
+                    }
+
+                    // Add to current group
+                    current_name = Some(name);
+                    if self.paired {
+                        if info.is_read1 { current_read1s.push(info); }
+                        else if info.is_read2 { current_read2s.push(info); }
+                    } else {
+                        current_singles.push(info);
+                    }
+                }
+                None => {
+                    // Skipped record (unmapped/duplicate/qc-fail) — continue reading
+                    continue;
+                }
+            }
+        }
+
+        self.total_groups += groups.len();
+        if groups.is_empty() { None } else { Some(groups) }
+    }
+
+    fn finalize_group(
+        &self,
+        current_name: &mut Option<String>,
+        current_read1s: &mut Vec<ReadInfo>,
+        current_read2s: &mut Vec<ReadInfo>,
+        current_singles: &mut Vec<ReadInfo>,
+        groups: &mut Vec<ReadGroup>,
+    ) {
+        if current_name.is_none() {
+            return;
+        }
+        *current_name = None;
+
+        if self.paired {
+            // Move data out
+            let r1s = std::mem::take(current_read1s);
+            let r2s = std::mem::take(current_read2s);
+            groups.push(ReadGroup::Paired { read1s: r1s, read2s: r2s });
+        } else {
+            let reads = std::mem::take(current_singles);
+            groups.push(ReadGroup::Single { reads });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation helper (shared between streaming and fallback paths)
+// ---------------------------------------------------------------------------
+
+struct AggState {
+    gene_counts: HashMap<String, f64>,
+    te_counts: Vec<f64>,
+    te_multi_counts: Vec<f64>,
+    multi_reads: Vec<Vec<usize>>,
+    leftover_gene: Vec<(Vec<Vec<String>>, f64)>,
+    leftover_te: Vec<(Vec<Vec<usize>>, f64)>,
+    empty: i64,
+    nonunique: i64,
+    uniq_reads: i64,
+    avg_read_length: i64,
+    tmp_cnt: i64,
+}
+
+impl AggState {
+    fn new(gene_index: &GeneIndex, te_index: &TEIndex) -> Self {
+        let mut gene_counts = HashMap::new();
+        for f in gene_index.features() {
+            gene_counts.insert(f, 0.0);
+        }
+        let n_te = te_index.num_instances();
+        AggState {
+            gene_counts,
+            te_counts: vec![0.0; n_te],
+            te_multi_counts: vec![0.0; n_te],
+            multi_reads: Vec::new(),
+            leftover_gene: Vec::new(),
+            leftover_te: Vec::new(),
+            empty: 0,
+            nonunique: 0,
+            uniq_reads: 0,
+            avg_read_length: 0,
+            tmp_cnt: 0,
+        }
+    }
+
+    fn aggregate(&mut self, annot_results: &[AnnotResult], te_mode: &str, max_length: i64) {
+        for res in annot_results {
+            if res.is_multi {
+                self.nonunique += 1;
+                if te_mode == "uniq" {
+                    self.empty += 1;
+                    continue;
+                }
+            } else {
+                self.uniq_reads += 1;
+                if let Some(fl) = res.frag_len {
+                    if fl <= max_length && self.tmp_cnt < 10000 {
+                        self.avg_read_length += fl;
+                        self.tmp_cnt += 1;
+                    }
+                }
+            }
+
+            let num_alignments = if res.is_multi {
+                res.annot_gene.len().max(res.annot_te.len()).max(1)
+            } else {
+                1
+            };
+
+            if num_alignments > 1 {
+                let no_annot_te = parse_annotations_te(
+                    &res.annot_te, &mut self.te_counts, &mut self.te_multi_counts,
+                    &mut self.multi_reads, &mut self.leftover_te,
+                );
+                if no_annot_te {
+                    let no_annot_gene = parse_annotations_gene(
+                        &res.annot_gene, &mut self.gene_counts, &mut self.leftover_gene,
+                    );
+                    if no_annot_gene { self.empty += 1; }
+                }
+            } else {
+                let no_annot_gene = parse_annotations_gene(
+                    &res.annot_gene, &mut self.gene_counts, &mut self.leftover_gene,
+                );
+                if no_annot_gene {
+                    let no_annot_te = parse_annotations_te(
+                        &res.annot_te, &mut self.te_counts, &mut self.te_multi_counts,
+                        &mut self.multi_reads, &mut self.leftover_te,
+                    );
+                    if no_annot_te { self.empty += 1; }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main counting function
 // ---------------------------------------------------------------------------
 
@@ -309,7 +562,35 @@ fn count_transcript_abundance(
     frag_length: i64,
     max_length: i64,
 ) -> CountResult {
-    // Phase 1: Read all records from BAM
+    if sort_by_pos {
+        // Try samtools sort -n to create a name-sorted temp BAM
+        match count_with_external_sort(bam_path, gene_index, te_index, stranded,
+                                       te_mode, num_iterations, frag_length, max_length) {
+            Ok(result) => return result,
+            Err(e) => {
+                eprintln!("samtools not available ({}), falling back to in-memory sort", e);
+                return count_in_memory(bam_path, gene_index, te_index, stranded,
+                                       te_mode, num_iterations, frag_length, max_length);
+            }
+        }
+    }
+
+    // Streaming path (BAM already sorted by name)
+    let mut reader = noodles_bam::io::reader::Builder::default()
+        .build_from_path(bam_path)
+        .unwrap_or_else(|e| {
+            eprintln!("Error opening BAM file {}: {}", bam_path, e);
+            std::process::exit(1);
+        });
+
+    let _header = reader.read_header().expect("Error reading BAM header");
+    // We need to rebuild references from the header. noodles consumed it.
+    // Re-open to get header separately.
+    // Actually we can get references from the header before passing reader to streamer.
+    // Let's get references first.
+    drop(reader);
+
+    // Re-open: read header, get references, then pass reader to streamer
     let mut reader = noodles_bam::io::reader::Builder::default()
         .build_from_path(bam_path)
         .unwrap_or_else(|e| {
@@ -323,182 +604,267 @@ fn count_transcript_abundance(
         .map(|(name, _)| name.to_string())
         .collect();
 
-    eprintln!("Reading BAM file...");
-    let mut alignments: Vec<ParsedAlignment> = Vec::new();
+    eprintln!("Reading BAM file (streaming mode)...");
+    let batch_size = 50_000;
+    let mut streamer = BamGroupStreamer::new(reader, batch_size);
+    let mut state = AggState::new(gene_index, te_index);
+    let mut batch_num = 0;
+
+    while let Some(groups) = streamer.next_batch() {
+        batch_num += 1;
+        let annot_results: Vec<AnnotResult> = groups
+            .par_iter()
+            .map(|group| overlap_annotation_readgroup(group, &references, gene_index, te_index, stranded))
+            .collect();
+
+        state.aggregate(&annot_results, te_mode, max_length);
+        // groups and annot_results dropped here — memory freed
+    }
+
+    eprintln!("Processed {} alignments in {} groups across {} batches.",
+              streamer.total_alignments, streamer.total_groups, batch_num);
+
+    finish_count(state, te_index, streamer.paired, num_iterations, frag_length)
+}
+
+/// Use samtools sort -n to create a name-sorted temp BAM, then stream it.
+fn count_with_external_sort(
+    bam_path: &str,
+    gene_index: &GeneIndex,
+    te_index: &TEIndex,
+    stranded: &str,
+    te_mode: &str,
+    num_iterations: i32,
+    frag_length: i64,
+    max_length: i64,
+) -> Result<CountResult, String> {
+    // Check samtools availability
+    let check = std::process::Command::new("samtools")
+        .arg("--version")
+        .output()
+        .map_err(|_| "samtools not found in PATH".to_string())?;
+    if !check.status.success() {
+        return Err("samtools --version failed".to_string());
+    }
+
+    let tmp_dir = std::env::temp_dir();
+    let tmp_bam = tmp_dir.join(format!("tetranscripts_namesort_{}.bam", std::process::id()));
+    let tmp_bam_str = tmp_bam.to_string_lossy().to_string();
+
+    eprintln!("Sorting BAM by read name with samtools...");
+    let status = std::process::Command::new("samtools")
+        .args(["sort", "-n", "-@", "2", "-o", &tmp_bam_str, bam_path])
+        .status()
+        .map_err(|e| format!("samtools sort failed: {}", e))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp_bam);
+        return Err("samtools sort -n exited with error".to_string());
+    }
+
+    eprintln!("Streaming sorted BAM...");
+    let result = count_streaming_from_path(&tmp_bam_str, gene_index, te_index, stranded,
+                                            te_mode, num_iterations, frag_length, max_length);
+
+    let _ = std::fs::remove_file(&tmp_bam);
+    result
+}
+
+/// Stream from a specific BAM path (used after external sort).
+fn count_streaming_from_path(
+    bam_path: &str,
+    gene_index: &GeneIndex,
+    te_index: &TEIndex,
+    stranded: &str,
+    te_mode: &str,
+    num_iterations: i32,
+    frag_length: i64,
+    max_length: i64,
+) -> Result<CountResult, String> {
+    let mut reader = noodles_bam::io::reader::Builder::default()
+        .build_from_path(bam_path)
+        .map_err(|e| format!("Error opening {}: {}", bam_path, e))?;
+
+    let header = reader.read_header().map_err(|e| format!("Error reading header: {}", e))?;
+    let references: Vec<String> = header.reference_sequences()
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+
+    let batch_size = 50_000;
+    let mut streamer = BamGroupStreamer::new(reader, batch_size);
+    let mut state = AggState::new(gene_index, te_index);
+
+    while let Some(groups) = streamer.next_batch() {
+        let annot_results: Vec<AnnotResult> = groups
+            .par_iter()
+            .map(|group| overlap_annotation_readgroup(group, &references, gene_index, te_index, stranded))
+            .collect();
+        state.aggregate(&annot_results, te_mode, max_length);
+    }
+
+    Ok(finish_count(state, te_index, streamer.paired, num_iterations, frag_length))
+}
+
+/// Fallback: load all into memory, sort, group, process (original approach but with SmallVec).
+fn count_in_memory(
+    bam_path: &str,
+    gene_index: &GeneIndex,
+    te_index: &TEIndex,
+    stranded: &str,
+    te_mode: &str,
+    num_iterations: i32,
+    frag_length: i64,
+    max_length: i64,
+) -> CountResult {
+    let mut reader = noodles_bam::io::reader::Builder::default()
+        .build_from_path(bam_path)
+        .unwrap_or_else(|e| {
+            eprintln!("Error opening BAM file {}: {}", bam_path, e);
+            std::process::exit(1);
+        });
+
+    let header = reader.read_header().expect("Error reading BAM header");
+    let references: Vec<String> = header.reference_sequences()
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+
+    eprintln!("Reading BAM file (in-memory fallback)...");
+    let mut names: Vec<String> = Vec::new();
+    let mut infos: Vec<ReadInfo> = Vec::new();
     let mut record = noodles_bam::Record::default();
     let mut paired = false;
+
     loop {
         match reader.read_record(&mut record) {
             Ok(0) => break,
             Ok(_) => {}
             Err(_) => continue,
         }
-        if let Some(aln) = parse_record_to_alignment(&record) {
-            if aln.info.is_paired { paired = true; }
-            alignments.push(aln);
+        if let Some((name, info)) = parse_record(&record) {
+            if info.is_paired { paired = true; }
+            names.push(name);
+            infos.push(info);
         }
     }
-    eprintln!("Read {} alignments.", alignments.len());
+    eprintln!("Read {} alignments.", names.len());
 
-    // Phase 2: Sort by name (parallel if sortByPos, already sorted otherwise)
-    if sort_by_pos {
-        eprintln!("Sorting by read name (parallel)...");
-        alignments.par_sort_by(|a, b| a.clean_name.cmp(&b.clean_name));
-    }
+    // Sort by name (parallel)
+    eprintln!("Sorting by read name...");
+    let mut indices: Vec<usize> = (0..names.len()).collect();
+    indices.par_sort_by(|&a, &b| names[a].cmp(&names[b]));
 
-    // Phase 3: Group by read name into ReadGroups
-    eprintln!("Grouping reads by name...");
-    let mut groups: Vec<ReadGroup> = Vec::new();
+    // Group by name and process in batches
+    let batch_size = 50_000;
+    let mut state = AggState::new(gene_index, te_index);
+    let mut batch_groups: Vec<ReadGroup> = Vec::with_capacity(batch_size);
+    let mut i = 0;
+    let mut batch_num = 0;
 
-    if paired {
-        let mut i = 0;
-        while i < alignments.len() {
-            let name = &alignments[i].clean_name;
-            let start = i;
-            while i < alignments.len() && &alignments[i].clean_name == name {
-                i += 1;
-            }
+    while i < indices.len() {
+        let start = i;
+        let name = &names[indices[start]];
+
+        while i < indices.len() && &names[indices[i]] == name {
+            i += 1;
+        }
+
+        // Build group
+        if paired {
             let mut read1s = Vec::new();
             let mut read2s = Vec::new();
             for j in start..i {
-                let info = alignments[j].info.clone();
+                let info = infos[indices[j]].clone();
                 if info.is_read1 { read1s.push(info.clone()); }
                 if info.is_read2 { read2s.push(info); }
             }
-            groups.push(ReadGroup::Paired { read1s, read2s });
-        }
-    } else {
-        let mut i = 0;
-        while i < alignments.len() {
-            let name = &alignments[i].clean_name;
-            let start = i;
-            while i < alignments.len() && &alignments[i].clean_name == name {
-                i += 1;
-            }
-            let reads: Vec<ReadInfo> = (start..i).map(|j| alignments[j].info.clone()).collect();
-            groups.push(ReadGroup::Single { reads });
-        }
-    }
-    eprintln!("{} read groups formed.", groups.len());
-
-    // Phase 4: Parallel overlap annotation (read-only on indexes)
-    eprintln!("Running parallel overlap annotation...");
-    let annot_results: Vec<AnnotResult> = groups
-        .par_iter()
-        .map(|group| overlap_annotation_readgroup(group, &references, gene_index, te_index, stranded))
-        .collect();
-
-    // Phase 5: Serial count aggregation
-    eprintln!("Aggregating counts...");
-    let mut gene_counts: HashMap<String, f64> = HashMap::new();
-    for f in gene_index.features() {
-        gene_counts.insert(f, 0.0);
-    }
-
-    let n_te = te_index.num_instances();
-    let mut te_counts = vec![0.0; n_te];
-    let mut te_multi_counts = vec![0.0; n_te];
-    let mut multi_reads: Vec<Vec<usize>> = Vec::new();
-    let mut leftover_gene: Vec<(Vec<Vec<String>>, f64)> = Vec::new();
-    let mut leftover_te: Vec<(Vec<Vec<usize>>, f64)> = Vec::new();
-    let mut empty: i64 = 0;
-    let mut nonunique: i64 = 0;
-    let mut uniq_reads: i64 = 0;
-    let mut avg_read_length: i64 = 0;
-    let mut tmp_cnt: i64 = 0;
-
-    for res in &annot_results {
-        if res.is_multi {
-            nonunique += 1;
-            if te_mode == "uniq" {
-                empty += 1;
-                continue;
-            }
+            batch_groups.push(ReadGroup::Paired { read1s, read2s });
         } else {
-            uniq_reads += 1;
-            if let Some(fl) = res.frag_len {
-                if fl <= max_length && tmp_cnt < 10000 {
-                    avg_read_length += fl;
-                    tmp_cnt += 1;
-                }
-            }
+            let reads: Vec<ReadInfo> = (start..i).map(|j| infos[indices[j]].clone()).collect();
+            batch_groups.push(ReadGroup::Single { reads });
         }
 
-        let num_alignments = if res.is_multi {
-            res.annot_gene.len().max(res.annot_te.len()).max(1)
-        } else {
-            1
-        };
-
-        if num_alignments > 1 {
-            let no_annot_te = parse_annotations_te(
-                &res.annot_te, &mut te_counts, &mut te_multi_counts,
-                &mut multi_reads, &mut leftover_te,
-            );
-            if no_annot_te {
-                let no_annot_gene = parse_annotations_gene(
-                    &res.annot_gene, &mut gene_counts, &mut leftover_gene,
-                );
-                if no_annot_gene { empty += 1; }
-            }
-        } else {
-            let no_annot_gene = parse_annotations_gene(
-                &res.annot_gene, &mut gene_counts, &mut leftover_gene,
-            );
-            if no_annot_gene {
-                let no_annot_te = parse_annotations_te(
-                    &res.annot_te, &mut te_counts, &mut te_multi_counts,
-                    &mut multi_reads, &mut leftover_te,
-                );
-                if no_annot_te { empty += 1; }
-            }
+        if batch_groups.len() >= batch_size {
+            batch_num += 1;
+            let annot_results: Vec<AnnotResult> = batch_groups
+                .par_iter()
+                .map(|group| overlap_annotation_readgroup(group, &references, gene_index, te_index, stranded))
+                .collect();
+            state.aggregate(&annot_results, te_mode, max_length);
+            batch_groups.clear();
         }
     }
 
+    // Process remaining
+    if !batch_groups.is_empty() {
+        batch_num += 1;
+        let annot_results: Vec<AnnotResult> = batch_groups
+            .par_iter()
+            .map(|group| overlap_annotation_readgroup(group, &references, gene_index, te_index, stranded))
+            .collect();
+        state.aggregate(&annot_results, te_mode, max_length);
+    }
+
+    eprintln!("Processed {} batches.", batch_num);
+    finish_count(state, te_index, paired, num_iterations, frag_length)
+}
+
+// ---------------------------------------------------------------------------
+// Finalize: resolve ambiguity, EM, return CountResult
+// ---------------------------------------------------------------------------
+
+fn finish_count(
+    mut state: AggState,
+    te_index: &TEIndex,
+    paired: bool,
+    num_iterations: i32,
+    frag_length: i64,
+) -> CountResult {
     // Resolve leftover ambiguities
-    if !leftover_gene.is_empty() {
-        resolve_annotation_ambiguity_gene(&mut gene_counts, &leftover_gene);
+    if !state.leftover_gene.is_empty() {
+        resolve_annotation_ambiguity_gene(&mut state.gene_counts, &state.leftover_gene);
     }
-    if !leftover_te.is_empty() {
-        resolve_annotation_ambiguity_te(&mut te_counts, &leftover_te);
+    if !state.leftover_te.is_empty() {
+        resolve_annotation_ambiguity_te(&mut state.te_counts, &state.leftover_te);
     }
 
-    eprintln!("uniq te counts = {}", te_counts.iter().sum::<f64>() as i64);
+    eprintln!("uniq te counts = {}", state.te_counts.iter().sum::<f64>() as i64);
 
     let estimated_read_length = if !paired && frag_length > 0 {
         frag_length
-    } else if avg_read_length > 0 && tmp_cnt > 0 {
-        avg_read_length / tmp_cnt
+    } else if state.avg_read_length > 0 && state.tmp_cnt > 0 {
+        state.avg_read_length / state.tmp_cnt
     } else {
         100
     };
 
-    let new_te_multi_counts = if num_iterations > 0 && !multi_reads.is_empty() {
+    let new_te_multi_counts = if num_iterations > 0 && !state.multi_reads.is_empty() {
         eprintln!("Starting iterative optimization...");
-        em_estimate(te_index, &multi_reads, &te_counts, &te_multi_counts,
+        em_estimate(te_index, &state.multi_reads, &state.te_counts, &state.te_multi_counts,
                     num_iterations, estimated_read_length)
     } else {
-        te_multi_counts
+        state.te_multi_counts
     };
 
-    for j in 0..te_counts.len() {
-        te_counts[j] += new_te_multi_counts[j];
+    for j in 0..state.te_counts.len() {
+        state.te_counts[j] += new_te_multi_counts[j];
     }
 
-    let st: f64 = te_counts.iter().sum();
-    let sg: f64 = gene_counts.values().sum();
+    let st: f64 = state.te_counts.iter().sum();
+    let sg: f64 = state.gene_counts.values().sum();
 
     eprintln!("TE counts total {}", st);
     eprintln!("Gene counts total {}", sg);
     eprintln!("Total annotated = {}", (st + sg) as i64);
-    eprintln!("Total non-unique = {}", nonunique);
-    eprintln!("Total unannotated = {}", empty);
+    eprintln!("Total non-unique = {}", state.nonunique);
+    eprintln!("Total unannotated = {}", state.empty);
 
     CountResult {
-        gene_counts,
-        te_instance_counts: te_counts,
+        gene_counts: state.gene_counts,
+        te_instance_counts: state.te_counts,
         total_annotated: (st + sg) as i64,
-        total_nonunique: nonunique,
-        total_unannotated: empty,
+        total_nonunique: state.nonunique,
+        total_unannotated: state.empty,
     }
 }
