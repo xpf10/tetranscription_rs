@@ -88,6 +88,9 @@ pub struct TEIndex {
     lengths: Vec<i64>,
     name_id_map: Vec<String>,
     elements: Vec<String>,
+    loc_chroms: Vec<String>,
+    loc_starts: Vec<i64>,
+    loc_ends: Vec<i64>,
 }
 
 #[pymethods]
@@ -100,6 +103,9 @@ impl TEIndex {
         let mut name_id_map = Vec::new();
         let mut elements: Vec<String> = Vec::new();
         let mut seen_elements: HashSet<String> = HashSet::new();
+        let mut loc_chroms = Vec::new();
+        let mut loc_starts = Vec::new();
+        let mut loc_ends = Vec::new();
 
         for rec in &records {
             let tlen = rec.end - rec.start + 1;
@@ -120,6 +126,9 @@ impl TEIndex {
             let name_idx = name_id_map.len();
             lengths.push(tlen);
             name_id_map.push(full_name);
+            loc_chroms.push(rec.chrom.clone());
+            loc_starts.push(rec.start);
+            loc_ends.push(rec.end);
 
             // Store the TE interval directly — no bin splitting needed
             tree_entries
@@ -134,7 +143,7 @@ impl TEIndex {
             .map(|(chrom, entries)| (chrom, TeTree::new(entries)))
             .collect();
 
-        TEIndex { trees, lengths, name_id_map, elements }
+        TEIndex { trees, lengths, name_id_map, elements, loc_chroms, loc_starts, loc_ends }
     }
 
     pub fn num_instances(&self) -> usize {
@@ -185,6 +194,21 @@ impl TEIndex {
 
     pub fn get_elements(&self) -> Vec<String> {
         self.elements.clone()
+    }
+
+    pub fn get_locus_names(&self) -> Vec<String> {
+        (0..self.name_id_map.len()).map(|i| {
+            let full = &self.name_id_map[i];
+            let parts: Vec<&str> = full.split(':').collect();
+            let transcript_id = parts.get(0).unwrap_or(&"");
+            let gene_id = parts.get(1).unwrap_or(&"");
+            let family_id = parts.get(2).unwrap_or(&"");
+            let class_id = parts.get(3).unwrap_or(&"");
+            let strand = parts.get(4).unwrap_or(&"");
+            format!("{}:{}-{}:{}:{}:{}:{}:{}",
+                self.loc_chroms[i], self.loc_starts[i], self.loc_ends[i],
+                transcript_id, gene_id, family_id, class_id, strand)
+        }).collect()
     }
 }
 

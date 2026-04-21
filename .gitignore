@@ -36,3 +36,5 @@ Cargo.lock
 test_data/*
 
 CLAUDE.md
+
+saturation_results/
